@@ -39,12 +39,16 @@ load_env() {
     : "${DEPO_INSTANCE_TYPE_X86:=t3.medium}"
     : "${DEPO_INSTANCE_TYPE_ARM:=t4g.medium}"
     : "${DEPO_CACHE_VOLUME_SIZE:=50}"
+    # Spot instances: DEPO_USE_SPOT=true enables spot, DEPO_SPOT_MAX_PRICE is optional
+    : "${DEPO_USE_SPOT:=}"
+    : "${DEPO_SPOT_MAX_PRICE:=}"
 
     export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION
     export DOCKERHUB_USER DOCKERHUB_PASSWORD
     export DEPO_KEY_PAIR_NAME DEPO_SECURITY_GROUP_NAME
     export DEPO_INSTANCE_TYPE_X86 DEPO_INSTANCE_TYPE_ARM
     export DEPO_CACHE_VOLUME_SIZE
+    export DEPO_USE_SPOT DEPO_SPOT_MAX_PRICE
 }
 
 # Show help
@@ -99,6 +103,8 @@ Environment Variables (set in .env or export):
     DEPO_INSTANCE_TYPE_X86  Instance type for x86 builds (default: t3.medium)
     DEPO_INSTANCE_TYPE_ARM  Instance type for arm builds (default: t4g.medium)
     DEPO_CACHE_VOLUME_SIZE  Cache EBS volume size in GB (default: 50)
+    DEPO_USE_SPOT           Set to 'true' to use spot instances (default: off)
+    DEPO_SPOT_MAX_PRICE     Max hourly price for spot (optional, defaults to on-demand price)
 EOF
 }
 
@@ -426,10 +432,20 @@ handle_build() {
         instance_type="$DEPO_INSTANCE_TYPE_ARM"
     fi
     
+    # Determine if using spot instances
+    local use_spot="false"
+    if [[ "${DEPO_USE_SPOT}" == "true" || "${DEPO_USE_SPOT}" == "1" ]]; then
+        use_spot="true"
+        log_info "Using spot instances"
+        if [[ -n "${DEPO_SPOT_MAX_PRICE}" ]]; then
+            log_info "Spot max price: \$${DEPO_SPOT_MAX_PRICE}/hour"
+        fi
+    fi
+
     log_info "Deploying build server in ${cache_az}..."
-    
+
     terraform init -input=false > /dev/null
-    
+
     terraform apply -auto-approve \
         -var "aws_region=${AWS_REGION}" \
         -var "ami_id=${ami_id}" \
@@ -438,7 +454,9 @@ handle_build() {
         -var "cache_volume_id=${cache_vol_id}" \
         -var "availability_zone=${cache_az}" \
         -var "key_pair_name=${DEPO_KEY_PAIR_NAME}" \
-        -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}"
+        -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}" \
+        -var "use_spot=${use_spot}" \
+        -var "spot_max_price=${DEPO_SPOT_MAX_PRICE}"
     
     # Get instance details
     instance_ip=$(terraform output -raw instance_public_ip)
@@ -464,7 +482,9 @@ handle_build() {
                 -var "cache_volume_id=${cache_vol_id}" \
                 -var "availability_zone=${cache_az}" \
                 -var "key_pair_name=${DEPO_KEY_PAIR_NAME}" \
-                -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}"
+                -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}" \
+                -var "use_spot=${use_spot}" \
+                -var "spot_max_price=${DEPO_SPOT_MAX_PRICE}"
             rm -f "$context_tar"
             exit 1
         fi
@@ -489,6 +509,10 @@ set -e
 
 # Extract build context
 echo "Extracting build context..."
+# Remove existing build directory if it exists
+if [ -d /home/ec2-user/build ]; then
+  rm -rf /home/ec2-user/build
+fi
 mkdir -p /home/ec2-user/build
 cd /home/ec2-user/build
 tar -xzf /tmp/build-context.tar.gz
@@ -534,7 +558,9 @@ REMOTE_EOF
         -var "cache_volume_id=${cache_vol_id}" \
         -var "availability_zone=${cache_az}" \
         -var "key_pair_name=${DEPO_KEY_PAIR_NAME}" \
-        -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}"
+        -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}" \
+        -var "use_spot=${use_spot}" \
+        -var "spot_max_price=${DEPO_SPOT_MAX_PRICE}"
     
     if [[ $build_status -eq 0 ]]; then
         log_success "Build completed successfully!"
