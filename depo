@@ -349,15 +349,20 @@ handle_manage() {
 # Handle build command
 handle_build() {
     load_env
-    
-    local arch="x86_64"
+
+    local arch=""
+    local platform=""
     local docker_args=()
-    
+
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
             --arch=*)
                 arch="${1#*=}"
+                ;;
+            --platform=*)
+                platform="${1#*=}"
+                docker_args+=("$1")
                 ;;
             *)
                 docker_args+=("$1")
@@ -365,7 +370,19 @@ handle_build() {
         esac
         shift
     done
-    
+
+    # If arch not explicitly set, infer from --platform
+    if [[ -z "$arch" ]]; then
+        case "$platform" in
+            linux/arm64|linux/arm64/*)
+                arch="arm64"
+                ;;
+            *)
+                arch="x86_64"
+                ;;
+        esac
+    fi
+
     # Validate arch
     if [[ "$arch" != "x86_64" && "$arch" != "arm64" ]]; then
         log_error "Invalid architecture: ${arch}. Must be x86_64 or arm64"
