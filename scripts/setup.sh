@@ -32,6 +32,7 @@ fi
 : "${AWS_REGION:=us-east-1}"
 : "${DEPO_KEY_PAIR_NAME:=depo-builder}"
 : "${DEPO_SECURITY_GROUP_NAME:=depo-builder-sg}"
+: "${DEPO_ECR_REPO_NAME:=depo-cache}"
 
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION
 
@@ -99,12 +100,29 @@ else
     log_success "Security group created and configured: ${sg_id}"
 fi
 
+# Create ECR repository for build cache
+log_info "Checking for ECR repository: ${DEPO_ECR_REPO_NAME}"
+ecr_repo=$(aws ecr describe-repositories --repository-names "$DEPO_ECR_REPO_NAME" \
+    --query 'repositories[0].repositoryUri' --output text 2>/dev/null || echo "")
+
+if [[ -n "$ecr_repo" && "$ecr_repo" != "None" ]]; then
+    log_warn "ECR repository ${DEPO_ECR_REPO_NAME} already exists: ${ecr_repo}"
+else
+    log_info "Creating ECR repository: ${DEPO_ECR_REPO_NAME}"
+    ecr_repo=$(aws ecr create-repository \
+        --repository-name "$DEPO_ECR_REPO_NAME" \
+        --image-scanning-configuration scanOnPush=false \
+        --query 'repository.repositoryUri' \
+        --output text)
+
+    log_success "ECR repository created: ${ecr_repo}"
+fi
+
 echo ""
 log_success "Setup complete!"
 echo ""
 echo "Next steps:"
-echo "  1. Create AMIs:         ./depo manage ami create"
-echo "  2. Create cache volumes: ./depo manage cache create"
-echo "  3. Run a build:         ./depo build -t yourimage:tag . --push"
+echo "  1. Create AMIs:  ./depo manage ami create"
+echo "  2. Run a build:  ./depo build -t yourimage:tag . --push"
 echo ""
-echo "Check status with:        ./depo manage status"
+echo "Check status with: ./depo manage status"

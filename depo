@@ -38,7 +38,7 @@ load_env() {
     : "${DEPO_SECURITY_GROUP_NAME:=depo-builder-sg}"
     : "${DEPO_INSTANCE_TYPE_X86:=t3.medium}"
     : "${DEPO_INSTANCE_TYPE_ARM:=t4g.medium}"
-    : "${DEPO_CACHE_VOLUME_SIZE:=50}"
+    : "${DEPO_ECR_REPO_NAME:=depo-cache}"
     # Spot instances: DEPO_USE_SPOT=true enables spot, DEPO_SPOT_MAX_PRICE is optional
     : "${DEPO_USE_SPOT:=}"
     : "${DEPO_SPOT_MAX_PRICE:=}"
@@ -47,7 +47,7 @@ load_env() {
     export DOCKERHUB_USER DOCKERHUB_PASSWORD
     export DEPO_KEY_PAIR_NAME DEPO_SECURITY_GROUP_NAME
     export DEPO_INSTANCE_TYPE_X86 DEPO_INSTANCE_TYPE_ARM
-    export DEPO_CACHE_VOLUME_SIZE
+    export DEPO_ECR_REPO_NAME
     export DEPO_USE_SPOT DEPO_SPOT_MAX_PRICE
 }
 
@@ -60,7 +60,7 @@ Usage: depo <command> [options]
 
 Commands:
     build       Run a remote Docker build
-    manage      Manage infrastructure (AMIs, EBS volumes)
+    manage      Manage infrastructure (AMIs, ECR cache)
     help        Show this help message
 
 Build Usage:
@@ -75,22 +75,18 @@ Build Usage:
 
 Manage Usage:
     depo manage <subcommand> [options]
-    
+
     Subcommands:
         ami create      Create/update Packer AMIs
         ami delete      Delete Packer AMIs
-        cache create    Create cache EBS volumes
-        cache delete    Delete cache EBS volumes
         status          Show current infrastructure status
-    
+
     Options:
         --arch=x86_64|arm64|all    Target architecture (default: all)
-    
+
     Examples:
         depo manage ami create                 # Create both x86 and arm AMIs
         depo manage ami create --arch=x86_64   # Create only x86 AMI
-        depo manage cache create               # Create both cache volumes
-        depo manage cache delete --arch=arm64  # Delete only arm cache volume
         depo manage status                     # Show infrastructure status
 
 Environment Variables (set in .env or export):
@@ -102,7 +98,7 @@ Environment Variables (set in .env or export):
     DEPO_KEY_PAIR_NAME      EC2 key pair name (default: depo-builder)
     DEPO_INSTANCE_TYPE_X86  Instance type for x86 builds (default: t3.medium)
     DEPO_INSTANCE_TYPE_ARM  Instance type for arm builds (default: t4g.medium)
-    DEPO_CACHE_VOLUME_SIZE  Cache EBS volume size in GB (default: 50)
+    DEPO_ECR_REPO_NAME      ECR repository for build cache (default: depo-cache)
     DEPO_USE_SPOT           Set to 'true' to use spot instances (default: off)
     DEPO_SPOT_MAX_PRICE     Max hourly price for spot (optional, defaults to on-demand price)
 EOF
@@ -118,12 +114,11 @@ get_ami_id() {
         --output text 2>/dev/null || echo "None"
 }
 
-# Get cache volume ID by architecture
-get_cache_volume_id() {
-    local arch=$1
-    aws ec2 describe-volumes \
-        --filters "Name=tag:Name,Values=depo-cache-${arch}" \
-        --query 'Volumes[0].VolumeId' \
+# Get ECR repository URI
+get_ecr_repo_uri() {
+    aws ecr describe-repositories \
+        --repository-names "$DEPO_ECR_REPO_NAME" \
+        --query 'repositories[0].repositoryUri' \
         --output text 2>/dev/null || echo "None"
 }
 
@@ -131,7 +126,7 @@ get_cache_volume_id() {
 show_status() {
     load_env
     log_info "Checking infrastructure status in ${AWS_REGION}..."
-    
+
     echo ""
     echo "=== AMIs ==="
     for arch in x86_64 arm64; do
@@ -142,19 +137,16 @@ show_status() {
             echo -e "  ${arch}: ${RED}Not found${NC}"
         fi
     done
-    
+
     echo ""
-    echo "=== Cache EBS Volumes ==="
-    for arch in x86_64 arm64; do
-        vol_id=$(get_cache_volume_id "$arch")
-        if [[ "$vol_id" != "None" && -n "$vol_id" ]]; then
-            vol_state=$(aws ec2 describe-volumes --volume-ids "$vol_id" --query 'Volumes[0].State' --output text 2>/dev/null)
-            echo -e "  ${arch}: ${GREEN}${vol_id}${NC} (${vol_state})"
-        else
-            echo -e "  ${arch}: ${RED}Not found${NC}"
-        fi
-    done
-    
+    echo "=== ECR Cache Repository ==="
+    ecr_uri=$(get_ecr_repo_uri)
+    if [[ "$ecr_uri" != "None" && -n "$ecr_uri" ]]; then
+        echo -e "  ${DEPO_ECR_REPO_NAME}: ${GREEN}${ecr_uri}${NC}"
+    else
+        echo -e "  ${DEPO_ECR_REPO_NAME}: ${RED}Not found${NC}"
+    fi
+
     echo ""
     echo "=== Key Pair ==="
     key_exists=$(aws ec2 describe-key-pairs --key-names "$DEPO_KEY_PAIR_NAME" --query 'KeyPairs[0].KeyName' --output text 2>/dev/null || echo "None")
@@ -163,7 +155,7 @@ show_status() {
     else
         echo -e "  ${DEPO_KEY_PAIR_NAME}: ${RED}not found${NC}"
     fi
-    
+
     echo ""
     echo "=== Security Group ==="
     sg_id=$(aws ec2 describe-security-groups --group-names "$DEPO_SECURITY_GROUP_NAME" --query 'SecurityGroups[0].GroupId' --output text 2>/dev/null || echo "None")
@@ -185,6 +177,7 @@ create_ami() {
     
     packer init .
     packer build \
+        -on-error=ask \
         -var "aws_region=${AWS_REGION}" \
         -var "architecture=${arch}" \
         -only="amazon-ebs.depo-builder-${arch}" \
@@ -222,51 +215,6 @@ delete_ami() {
     done
     
     log_success "AMI deleted for ${arch}"
-}
-
-# Create cache EBS volume
-create_cache_volume() {
-    local arch=$1
-    load_env
-    
-    existing_vol=$(get_cache_volume_id "$arch")
-    if [[ "$existing_vol" != "None" && -n "$existing_vol" ]]; then
-        log_warn "Cache volume already exists for ${arch}: ${existing_vol}"
-        return 0
-    fi
-    
-    log_info "Creating cache EBS volume for ${arch}..."
-    
-    # Get default AZ for the region
-    az=$(aws ec2 describe-availability-zones \
-        --query 'AvailabilityZones[0].ZoneName' --output text)
-    
-    vol_id=$(aws ec2 create-volume \
-        --availability-zone "$az" \
-        --size "$DEPO_CACHE_VOLUME_SIZE" \
-        --volume-type gp3 \
-        --tag-specifications "ResourceType=volume,Tags=[{Key=Name,Value=depo-cache-${arch}},{Key=depo-arch,Value=${arch}}]" \
-        --query 'VolumeId' --output text)
-    
-    log_success "Cache volume created for ${arch}: ${vol_id}"
-}
-
-# Delete cache EBS volume
-delete_cache_volume() {
-    local arch=$1
-    load_env
-    
-    vol_id=$(get_cache_volume_id "$arch")
-    if [[ "$vol_id" == "None" || -z "$vol_id" ]]; then
-        log_warn "No cache volume found for ${arch}"
-        return 0
-    fi
-    
-    log_info "Deleting cache volume ${vol_id} for ${arch}..."
-    
-    aws ec2 delete-volume --volume-id "$vol_id"
-    
-    log_success "Cache volume deleted for ${arch}"
 }
 
 # Run command for both architectures concurrently or single arch
@@ -329,12 +277,6 @@ handle_manage() {
         "ami delete")
             run_for_arch delete_ami "$arch"
             ;;
-        "cache create")
-            run_for_arch create_cache_volume "$arch"
-            ;;
-        "cache delete")
-            run_for_arch delete_cache_volume "$arch"
-            ;;
         "status")
             show_status
             ;;
@@ -363,9 +305,6 @@ handle_build() {
                 -var "aws_region=${AWS_REGION:-us-east-1}" \
                 -var "ami_id=${ami_id:-ami-placeholder}" \
                 -var "instance_type=${instance_type:-t3.medium}" \
-                -var "architecture=${arch:-x86_64}" \
-                -var "cache_volume_id=${cache_vol_id:-vol-placeholder}" \
-                -var "availability_zone=${cache_az:-us-east-1a}" \
                 -var "key_pair_name=${DEPO_KEY_PAIR_NAME:-depo-builder}" \
                 -var "security_group_name=${DEPO_SECURITY_GROUP_NAME:-depo-builder-sg}" \
                 -var "use_spot=${use_spot:-false}" \
@@ -414,38 +353,40 @@ handle_build() {
         log_error "Invalid architecture: ${arch}. Must be x86_64 or arm64"
         exit 1
     fi
-    
+
     # Check prerequisites
     ami_id=$(get_ami_id "$arch")
     if [[ "$ami_id" == "None" || -z "$ami_id" ]]; then
         log_error "No AMI found for ${arch}. Run 'depo manage ami create --arch=${arch}' first."
         exit 1
     fi
-    
-    cache_vol_id=$(get_cache_volume_id "$arch")
-    if [[ "$cache_vol_id" == "None" || -z "$cache_vol_id" ]]; then
-        log_error "No cache volume found for ${arch}. Run 'depo manage cache create --arch=${arch}' first."
+
+    ecr_repo_uri=$(get_ecr_repo_uri)
+    if [[ "$ecr_repo_uri" == "None" || -z "$ecr_repo_uri" ]]; then
+        log_error "ECR cache repository not found. Run './scripts/setup.sh' first."
         exit 1
     fi
-    
-    log_info "Starting build for ${arch}..."
-    log_info "AMI: ${ami_id}"
-    log_info "Cache Volume: ${cache_vol_id}"
-    log_info "Docker command: docker build ${docker_args[*]}"
-    
-    # Create build context tarball
+
+    # Derive cache reference from build context directory name
     local build_context_dir="."
-    local context_tar="/tmp/depo-context-$$.tar.gz"
-    
-    # Find context directory from docker args (last non-flag argument before any --file)
     for arg in "${docker_args[@]}"; do
         if [[ ! "$arg" =~ ^- && -d "$arg" ]]; then
             build_context_dir="$arg"
         fi
     done
-    
+    local project_name=$(basename "$(cd "$build_context_dir" && pwd)")
+    local cache_ref="${ecr_repo_uri}:${project_name}"
+
+    log_info "Starting build for ${arch}..."
+    log_info "AMI: ${ami_id}"
+    log_info "Cache: ${cache_ref}"
+    log_info "Docker command: docker buildx build ${docker_args[*]}"
+
+    # Create build context tarball
+    local context_tar="/tmp/depo-context-$$.tar.gz"
+
     log_info "Creating build context tarball from ${build_context_dir}..."
-    
+
     # Create tarball respecting .dockerignore
     if [[ -f "${build_context_dir}/.dockerignore" ]]; then
         tar -czf "$context_tar" -C "$build_context_dir" \
@@ -457,24 +398,20 @@ handle_build() {
             --exclude='.git' \
             .
     fi
-    
+
     local context_size=$(du -h "$context_tar" | cut -f1)
     log_info "Build context size: ${context_size}"
-    
+
     # Run Terraform to deploy build server
     cd "${SCRIPT_DIR}/terraform"
-    
-    # Get the AZ of the cache volume
-    cache_az=$(aws ec2 describe-volumes --volume-ids "$cache_vol_id" \
-        --query 'Volumes[0].AvailabilityZone' --output text)
-    
+
     # Determine instance type
     if [[ "$arch" == "x86_64" ]]; then
         instance_type="$DEPO_INSTANCE_TYPE_X86"
     else
         instance_type="$DEPO_INSTANCE_TYPE_ARM"
     fi
-    
+
     # Determine if using spot instances
     local use_spot="false"
     if [[ "${DEPO_USE_SPOT}" == "true" || "${DEPO_USE_SPOT}" == "1" ]]; then
@@ -485,7 +422,7 @@ handle_build() {
         fi
     fi
 
-    log_info "Deploying build server in ${cache_az}..."
+    log_info "Deploying build server..."
 
     terraform init -input=false > /dev/null
 
@@ -493,20 +430,17 @@ handle_build() {
         -var "aws_region=${AWS_REGION}" \
         -var "ami_id=${ami_id}" \
         -var "instance_type=${instance_type}" \
-        -var "architecture=${arch}" \
-        -var "cache_volume_id=${cache_vol_id}" \
-        -var "availability_zone=${cache_az}" \
         -var "key_pair_name=${DEPO_KEY_PAIR_NAME}" \
         -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}" \
         -var "use_spot=${use_spot}" \
         -var "spot_max_price=${DEPO_SPOT_MAX_PRICE}"
-    
+
     # Get instance details
     instance_ip=$(terraform output -state="$state_file" -raw instance_public_ip)
     instance_id=$(terraform output -state="$state_file" -raw instance_id)
-    
+
     log_info "Build server deployed: ${instance_id} (${instance_ip})"
-    
+
     # Wait for SSH to be available
     log_info "Waiting for SSH to be available..."
     local max_attempts=30
@@ -521,9 +455,6 @@ handle_build() {
                 -var "aws_region=${AWS_REGION}" \
                 -var "ami_id=${ami_id}" \
                 -var "instance_type=${instance_type}" \
-                -var "architecture=${arch}" \
-                -var "cache_volume_id=${cache_vol_id}" \
-                -var "availability_zone=${cache_az}" \
                 -var "key_pair_name=${DEPO_KEY_PAIR_NAME}" \
                 -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}" \
                 -var "use_spot=${use_spot}" \
@@ -534,26 +465,29 @@ handle_build() {
         fi
         sleep 5
     done
-    
+
     log_success "SSH connection established"
-    
+
     # Transfer build context
     log_info "Transferring build context..."
     scp -o StrictHostKeyChecking=no \
         -i "${SCRIPT_DIR}/${DEPO_KEY_PAIR_NAME}.pem" \
         "$context_tar" \
         ec2-user@"$instance_ip":/tmp/build-context.tar.gz
-    
+
+    # Get AWS account ID for ECR login
+    local aws_account_id=$(aws sts get-caller-identity --query Account --output text)
+    local ecr_registry="${aws_account_id}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
     # Run the build
     log_info "Running Docker build..."
-   
-   # Construct remote commands
+
+    # Construct remote commands
     local remote_script=$(cat << REMOTE_EOF
 set -e
 
 # Extract build context
 echo "Extracting build context..."
-# Remove existing build directory if it exists
 if [ -d /home/ec2-user/build ]; then
   rm -rf /home/ec2-user/build
 fi
@@ -561,23 +495,27 @@ mkdir -p /home/ec2-user/build
 cd /home/ec2-user/build
 tar -xzf /tmp/build-context.tar.gz
 
-sudo service docker stop || true
-sudo service docker stop || true
-sudo service docker start
-
 # Wait for Docker to be ready
 while ! docker info &>/dev/null; do
     echo "Waiting for Docker..."
     sleep 2
 done
 
-# Login to Docker Hub
+# Login to ECR for cache
+echo "Logging into ECR..."
+aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ecr_registry}
+
+# Login to Docker Hub for push
 echo "Logging into Docker Hub..."
 echo '${DOCKERHUB_PASSWORD}' | docker login -u '${DOCKERHUB_USER}' --password-stdin
 
-# Run the build
+# Run the build with buildx and ECR cache
+docker buildx create --name depo-builder --driver docker-container --use
 echo "Starting Docker build..."
-docker build ${docker_args[@]}
+docker buildx build \
+    --cache-from type=registry,ref=${cache_ref} \
+    --cache-to type=registry,ref=${cache_ref},oci-mediatypes=true,mode=max \
+    ${docker_args[@]}
 
 echo "Build completed successfully!"
 REMOTE_EOF
@@ -585,22 +523,19 @@ REMOTE_EOF
     ssh -tt -o StrictHostKeyChecking=no \
         -i "${SCRIPT_DIR}/${DEPO_KEY_PAIR_NAME}.pem" \
         ec2-user@"$instance_ip" "$remote_script"
-    
+
     local build_status=$?
-    
+
     # Cleanup
     log_info "Cleaning up..."
     rm -f "$context_tar"
-    
+
     # Destroy the instance
     log_info "Destroying build server..."
     terraform destroy -auto-approve -state="$state_file" \
         -var "aws_region=${AWS_REGION}" \
         -var "ami_id=${ami_id}" \
         -var "instance_type=${instance_type}" \
-        -var "architecture=${arch}" \
-        -var "cache_volume_id=${cache_vol_id}" \
-        -var "availability_zone=${cache_az}" \
         -var "key_pair_name=${DEPO_KEY_PAIR_NAME}" \
         -var "security_group_name=${DEPO_SECURITY_GROUP_NAME}" \
         -var "use_spot=${use_spot}" \

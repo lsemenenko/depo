@@ -31,6 +31,7 @@ fi
 : "${AWS_REGION:=us-east-1}"
 : "${DEPO_KEY_PAIR_NAME:=depo-builder}"
 : "${DEPO_SECURITY_GROUP_NAME:=depo-builder-sg}"
+: "${DEPO_ECR_REPO_NAME:=depo-cache}"
 
 export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION
 
@@ -38,7 +39,7 @@ echo -e "${RED}WARNING: This will delete all Depo infrastructure!${NC}"
 echo ""
 echo "This includes:"
 echo "  - All Depo AMIs (x86_64 and arm64)"
-echo "  - Cache EBS volumes (x86_64 and arm64)"
+echo "  - ECR cache repository: ${DEPO_ECR_REPO_NAME}"
 echo "  - Key pair: ${DEPO_KEY_PAIR_NAME}"
 echo "  - Security group: ${DEPO_SECURITY_GROUP_NAME}"
 echo "  - Local key file: ${DEPO_KEY_PAIR_NAME}.pem"
@@ -84,21 +85,17 @@ for arch in x86_64 arm64; do
     fi
 done
 
-# Delete cache volumes
-for arch in x86_64 arm64; do
-    log_info "Looking for ${arch} cache volume..."
-    vol_id=$(aws ec2 describe-volumes \
-        --filters "Name=tag:Name,Values=depo-cache-${arch}" \
-        --query 'Volumes[0].VolumeId' \
-        --output text 2>/dev/null || echo "None")
-    
-    if [[ "$vol_id" != "None" && -n "$vol_id" ]]; then
-        log_info "Deleting cache volume: ${vol_id}"
-        aws ec2 delete-volume --volume-id "$vol_id" || true
-    else
-        log_info "No ${arch} cache volume found"
-    fi
-done
+# Delete ECR repository
+log_info "Looking for ECR repository: ${DEPO_ECR_REPO_NAME}"
+ecr_repo=$(aws ecr describe-repositories --repository-names "$DEPO_ECR_REPO_NAME" \
+    --query 'repositories[0].repositoryUri' --output text 2>/dev/null || echo "None")
+
+if [[ "$ecr_repo" != "None" && -n "$ecr_repo" ]]; then
+    log_info "Deleting ECR repository: ${DEPO_ECR_REPO_NAME}"
+    aws ecr delete-repository --repository-name "$DEPO_ECR_REPO_NAME" --force || true
+else
+    log_info "No ECR repository found"
+fi
 
 # Delete key pair
 log_info "Deleting key pair: ${DEPO_KEY_PAIR_NAME}"
